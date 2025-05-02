@@ -1,0 +1,170 @@
+name: Build and Test Linux Kernel
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    # Run weekly on Sunday at midnight
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Kernel version to build (e.g., v6.6, v5.15.1)'
+        required: false
+        default: 'v6.6'
+      run_tests:
+        description: 'Run kernel tests'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  build-and-test:
+    name: Build and Test Kernel
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      options: --privileged
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            cross_compile: ''
+          # Uncomment to enable cross-compilation testing
+          # - arch: arm64
+          #   cross_compile: 'aarch64-linux-gnu-'
+          # - arch: riscv64
+          #   cross_compile: 'riscv64-linux-gnu-'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev \
+            git fakeroot ncurses-dev xz-utils bc rsync curl wget \
+            gcc-multilib gawk python3 python3-pip kmod cpio \
+            sparse coccinelle \
+            qemu-system-x86 qemu-utils \
+            clang llvm lld \
+            gdb cscope exuberant-ctags
+
+      # Install cross-compilers if needed
+      - name: Install cross-compilers
+        if: matrix.cross_compile != ''
+        run: |
+          if [[ "${{ matrix.arch }}" == "arm64" ]]; then
+            apt-get install -y gcc-aarch64-linux-gnu
+          elif [[ "${{ matrix.arch }}" == "riscv64" ]]; then
+            apt-get install -y gcc-riscv64-linux-gnu
+          else
+            echo "No cross-compiler needed for ${{ matrix.arch }}"
+          fi
+
+      - name: Set up environment
+        run: |
+          mkdir -p /kernel-build
+          mkdir -p /kernel-build-${{ matrix.arch }}
+          chmod +x ./scripts/setup.sh
+          chmod +x ./scripts/build-kernel.sh
+          chmod +x ./scripts/test-kernel.sh
+
+      - name: Set kernel version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.kernel_version }}" ]; then
+            echo "KERNEL_VERSION=${{ github.event.inputs.kernel_version }}" >> $GITHUB_ENV
+          else
+            echo "KERNEL_VERSION=v6.6" >> $GITHUB_ENV
+          fi
+
+      - name: Run setup script
+        run: |
+          ./scripts/setup.sh
+          source /workspace/.env.kernel
+          echo "KERNEL_SRC=/usr/src/linux" >> $GITHUB_ENV
+          echo "KBUILD_OUTPUT=/kernel-build-${{ matrix.arch }}" >> $GITHUB_ENV
+          echo "ARCH=${{ matrix.arch }}" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=${{ matrix.cross_compile }}" >> $GITHUB_ENV
+
+      - name: Build kernel
+        run: |
+          ./scripts/build-kernel.sh --version ${{ env.KERNEL_VERSION }} \
+            --type full \
+            --clean \
+            -j$(nproc)
+
+      # Build example kernel module
+      - name: Build example kernel module
+        if: matrix.arch == 'x86_64' # Only build module for x86_64
+        run: |
+          cd src/kernel-module-example
+          make KERNEL_SRC=/usr/src/linux KBUILD_OUTPUT=/kernel-build-${{ matrix.arch }}
+
+      # Run static analysis
+      - name: Run static analysis
+        run: |
+          ./scripts/test-kernel.sh static-analysis \
+            --arch ${{ matrix.arch }} \
+            --cross-compile ${{ matrix.cross_compile }} \
+            --output-dir ./kernel-test-results/static-analysis
+
+      # Run KUnit tests if requested
+      - name: Run KUnit tests
+        if: github.event.inputs.run_tests != 'false' && matrix.arch == 'x86_64'
+        run: |
+          ./scripts/test-kernel.sh kunit \
+            --arch ${{ matrix.arch }} \
+            --cross-compile ${{ matrix.cross_compile }} \
+            --output-dir ./kernel-test-results/kunit
+        continue-on-error: true
+
+      # Test with sanitizers (KASAN) if requested
+      - name: Test with KASAN
+        if: github.event.inputs.run_tests != 'false' && matrix.arch == 'x86_64'
+        run: |
+          ./scripts/test-kernel.sh sanitizers \
+            --arch ${{ matrix.arch }} \
+            --cross-compile ${{ matrix.cross_compile }} \
+            --output-dir ./kernel-test-results/sanitizers
+        continue-on-error: true
+
+      # Run quick QEMU test if requested
+      - name: Run QEMU test
+        if: github.event.inputs.run_tests != 'false' && matrix.arch == 'x86_64'
+        run: |
+          ./scripts/test-kernel.sh qemu \
+            --arch ${{ matrix.arch }} \
+            --cross-compile ${{ matrix.cross_compile }} \
+            --output-dir ./kernel-test-results/qemu
+        continue-on-error: true
+
+      # Archive kernel build artifacts
+      - name: Archive kernel artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: kernel-build-${{ env.KERNEL_VERSION }}-${{ matrix.arch }}
+          path: |
+            /kernel-build-${{ matrix.arch }}/arch/${{ matrix.arch }}/boot/bzImage
+            /kernel-build-${{ matrix.arch }}/*.deb
+            /kernel-build-${{ matrix.arch }}/*.rpm
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Archive test results
+      - name: Archive test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: kernel-test-results-${{ matrix.arch }}
+          path: |
+            ./kernel-test-results/**/*
+          retention-days: 7
+          if-no-files-found: ignore
